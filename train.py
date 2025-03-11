@@ -1,108 +1,96 @@
-def optimize_model_memory(model):
-    """
-    Optimizes the model to use less memory during training.
+import os
+import sys
 
-    Args:
-        model: The language model to optimize.
+import torch
+import torch.distributed as dist
+import wandb
+from torch.distributed.device_mesh import init_device_mesh
 
-    Returns:
-        The optimized model.
+from data import make_dataloaders
+from eval import evaluate_model
+from loss import train_with_grpo
+from model import (load_tokenizer, prepare_actor_rollout_model,
+                   prepare_ref_model)
+from reward import combined_reward
+from utils import init_distributed, is_main_process, set_random_seed
+from vlogging import init_logger, logger
 
-    Explanation:
-        1. Sets the model to training mode.
-        2. Disables KV caching to save memory.
-        3. Enables gradient checkpointing to trade computation for memory.
-        4. Ensures that input embeddings require gradients:
-           - Either uses the built-in method if available.
-           - Or adds a forward hook to the input embeddings layer.
-        5. Returns the optimized model ready for memory-efficient training.
-    """
-    model.train()
-    model.config.use_cache = False
 
-    # First ensure inputs will require gradients
-    if hasattr(model, "enable_input_require_grads"):
-        model.enable_input_require_grads()
-    else:
-        def make_inputs_require_grad(module, input, output):
-            output.requires_grad_(True)
-        model.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
+def main():
+    world_size, rank, local_rank = init_distributed()
+    model_name = sys.argv[1]
 
-    # Then enable gradient checkpointing
-    model.gradient_checkpointing_enable()
+    tokenizer = load_tokenizer(model_name)
+    mesh = init_device_mesh(device_type='cuda', mesh_shape=(dist.get_world_size(),))
+    model = prepare_actor_rollout_model(
+        ckpt_path=model_name,
+        eos_token_id=tokenizer.eos_token_id,
+        compile=False,
+        sac='no',
+        mesh=mesh,
+    )
+    ref_model = prepare_ref_model(
+        ckpt_path=model_name,
+        eos_token_id=tokenizer.eos_token_id,
+        compile=False,
+        mesh=mesh,
+    )
 
-    return model
+    batch_size = 1
+    train_data_loader, eval_data_loader = make_dataloaders(
+        data_path=sys.argv[2],
+        distributed=True,
+        dp_degree=world_size,
+        dp_rank=rank,
+        train_batch_size=batch_size,
+        num_workers=4
+    )
 
-# Main execution
-device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-print(f"Using primary device: {device}")
+    current_device = torch.device(f"cuda:{torch.cuda.current_device()}")
+    do_eval = sys.argv[3].lower() == "yes"
+    if do_eval:
+        logger.info("Initial model evaluation before finetuning:")
+        pre_grpo_accuracy = evaluate_model(model, tokenizer, eval_data_loader, current_device)
+        logger.info(f"Pre-GRPO Accuracy: {pre_grpo_accuracy:.2f}%")
+    logger.info("Starting RL fine-tuning using GRPO...")
+    # This config was tested on a 8xA100 node, where each A100 is has 80GB of VRAM
+    training_config = {
+        'num_iterations': 1,
+        'num_steps': 500,
+        'num_generations': 12,  # reduce if you have GPUs with less VRAM
+        'max_completion_length': 400,  # reduce if you have GPUs with less VRAM
+        'beta': 0.04,
+        'learning_rate': 1e-6,
+        'mu': 1,
+        'epsilon': 0.1
+    }
 
-model_name = "Qwen/Qwen2.5-1.5B-Instruct"
-output_dir = "math_solver_model"
+    # Initialize Weights & Biases
+    if is_main_process():
+        wandb.init(project=os.environ["WANDB_PROJECT"], reinit=True)
+    logger.info("Weights & Biases initialized.")
 
-print("Downloading model...")
-model = AutoModelForCausalLM.from_pretrained(
-    model_name,
-    torch_dtype=torch.bfloat16,
-    device_map="auto"
-)
-print("Model downloaded")
+    model = train_with_grpo(
+        model=model,
+        ref_model=ref_model,
+        tokenizer=tokenizer,
+        train_data=train_data_loader,
+        reward_function=combined_reward,
+        **training_config
+    )
 
-tokenizer = AutoTokenizer.from_pretrained(model_name, padding_side="left")
-tokenizer.pad_token = tokenizer.eos_token
-model.config.pad_token_id = tokenizer.eos_token_id
-model.config.eos_token_id = tokenizer.eos_token_id
+    if is_main_process():
+        wandb.finish()
+    logger.info("Training completed and wandb run finished.")
 
-num_gpus = torch.cuda.device_count()
-print(f"Detected {num_gpus} GPUs")
-device_ids = list(range(num_gpus)) if num_gpus > 1 else None
+    if do_eval:
+        logger.info("Final model evaluation after GRPO RL fine-tuning:")
+        post_grpo_accuracy = evaluate_model(model, tokenizer, eval_data_loader, current_device)
+        logger.info(f"Post-GRPO Accuracy: {post_grpo_accuracy:.2f}%")
 
-all_data = prepare_dataset("train")
-random.shuffle(all_data)
-size_of_eval_data = 30 # change to a smaller value to save time or to a larger number for a more reliable estimate
-eval_data = all_data[:size_of_eval_data]
-train_data = all_data[size_of_eval_data:]
 
-print("\nInitial model evaluation before finetuning:")
-pre_grpo_accuracy = evaluate_model(model, tokenizer, eval_data, device)
-print(f"Pre-GRPO Accuracy: {pre_grpo_accuracy:.2f}%")
-
-model = optimize_model_memory(model)
-
-print("\nStarting RL fine-tuning using GRPO...")
-# This config was tested on a 8xA100 node, where each A100 is has 80GB of VRAM
-training_config = {
-    'num_iterations': 1,
-    'num_steps': 500,
-    'batch_size': 7, # reduce if you have fewer GPUs
-    'num_generations': 12, # reduce if you have GPUs with less VRAM
-    'max_completion_length': 400, # reduce if you have GPUs with less VRAM
-    'beta': 0.04,
-    'learning_rate': 5e-6,
-    'mu': 1,
-    'epsilon': 0.1
-}
-
-# Initialize Weights & Biases
-wandb.init(project=os.environ["WANDB_PROJECT"], reinit=True)
-print("Weights & Biases initialized.")
-
-model = train_with_grpo(
-    model=model,
-    tokenizer=tokenizer,
-    train_data=train_data,
-    reward_function=combined_reward,
-    device_ids=device_ids,
-    **training_config
-)
-
-wandb.finish()
-print("Training completed and wandb run finished.")
-
-print("\nFinal model evaluation after GRPO RL fine-tuning:")
-post_grpo_accuracy = evaluate_model(model, tokenizer, eval_data, device)
-print(f"Post-GRPO Accuracy: {post_grpo_accuracy:.2f}%")
-
-print("\nSaving GRPO fine-tuned model...")
-model.save_pretrained("grpo_finetuned_model")
-tokenizer.save_pretrained("grpo_finetuned_model")
+if __name__ == "__main__":
+    # Call the function to set random seed for reproducibility
+    set_random_seed(42)
+    init_logger()
+    main()
