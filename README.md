@@ -4,7 +4,7 @@ A torch native grpo training example
 
 ### how to run
 
-`bash run.sh`
+`bash run.sh Qwen/Qwen2.5-1.5B-Instruct openai/gsm8k yes`
 
 
 ### reference:
