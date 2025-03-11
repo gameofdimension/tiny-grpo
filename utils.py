@@ -1,96 +1,85 @@
 import os
-import sys
+import random
 
+import numpy as np
 import torch
 import torch.distributed as dist
-import wandb
-from torch.distributed.device_mesh import init_device_mesh
-
-from data import make_dataloaders
-from eval import evaluate_model
-from loss import train_with_grpo
-from model import (load_tokenizer, prepare_actor_rollout_model,
-                   prepare_ref_model)
-from reward import combined_reward
-from utils import init_distributed, is_main_process, set_random_seed
-from vlogging import init_logger, logger
 
 
-def main():
-    world_size, rank, local_rank = init_distributed()
-    model_name = sys.argv[1]
+def set_random_seed(seed: int = 42):
+    """
+    Set the random seed for reproducibility across Python, NumPy, and PyTorch.
 
-    tokenizer = load_tokenizer(model_name)
-    mesh = init_device_mesh(device_type='cuda', mesh_shape=(dist.get_world_size(),))
-    model = prepare_actor_rollout_model(
-        ckpt_path=model_name,
-        eos_token_id=tokenizer.eos_token_id,
-        compile=False,
-        sac='no',
-        mesh=mesh,
+    Args:
+        seed (int): The seed value to use for random number generation.
+
+    Returns:
+        None
+
+    Explanation:
+        1. Sets seed for Python's built-in random module for basic random operations.
+        2. Sets seed for NumPy, ensuring consistent random number generation in array operations.
+        3. Sets seed for PyTorch CPU operations.
+        4. If CUDA is available, sets seed for all GPU devices.
+        5. Configures cuDNN to ensure deterministic behavior:
+           - Sets deterministic flag to True, ensuring reproducible results.
+           - Disables benchmarking to prevent algorithm selection based on hardware.
+
+    Note:
+        Setting deterministic behavior may impact performance but ensures consistent results
+        across multiple runs, which is crucial for debugging and research.
+    """
+    # Set the seed for Python's built-in random module
+    random.seed(seed)
+    # Set the seed for NumPy
+    np.random.seed(seed)
+    # Set the seed for PyTorch
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    # Ensure deterministic behavior in cuDNN (may impact performance)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+def is_main_process():
+    try:
+        if dist.get_rank() == 0:
+            return True
+        else:
+            return False
+    except Exception:
+        return True
+
+
+def cleanup():
+    dist.destroy_process_group()
+
+
+def init_distributed():
+
+    # Initializes the distributed backend
+    # which will take care of sychronizing nodes/GPUs
+    dist_url = "env://"  # default
+
+    # only works with torch.distributed.launch // torch.run
+    rank = int(os.environ["RANK"])
+    world_size = int(os.environ["WORLD_SIZE"])
+    local_rank = int(os.environ["LOCAL_RANK"])
+
+    # this will make all .cuda() calls work properly
+    torch.cuda.set_device(local_rank)
+
+    dist.init_process_group(
+        backend="nccl", init_method=dist_url, world_size=world_size, rank=rank,
+        device_id=torch.device(f"cuda:{torch.cuda.current_device()}"),
     )
-    ref_model = prepare_ref_model(
-        ckpt_path=model_name,
-        eos_token_id=tokenizer.eos_token_id,
-        compile=False,
-        mesh=mesh,
-    )
 
-    batch_size = 1
-    train_data_loader, eval_data_loader = make_dataloaders(
-        data_path=sys.argv[2],
-        distributed=True,
-        dp_degree=world_size,
-        dp_rank=rank,
-        train_batch_size=batch_size,
-        num_workers=4
-    )
+    # synchronizes all the threads to reach this point before moving on
+    dist.barrier()
+    return world_size, rank, local_rank
 
-    current_device = torch.device(f"cuda:{torch.cuda.current_device()}")
-    do_eval = sys.argv[3].lower() == "yes"
-    if do_eval:
-        logger.info("Initial model evaluation before finetuning:")
-        pre_grpo_accuracy = evaluate_model(model, tokenizer, eval_data_loader, current_device)
-        logger.info(f"Pre-GRPO Accuracy: {pre_grpo_accuracy:.2f}%")
-    logger.info("Starting RL fine-tuning using GRPO...")
-    # This config was tested on a 8xA100 node, where each A100 is has 80GB of VRAM
-    training_config = {
-        'num_iterations': 1,
-        'num_steps': 500,
-        'num_generations': 12,  # reduce if you have GPUs with less VRAM
-        'max_completion_length': 400,  # reduce if you have GPUs with less VRAM
-        'beta': 0.04,
-        'learning_rate': 1e-6,
-        'mu': 1,
-        'epsilon': 0.1
-    }
 
-    # Initialize Weights & Biases
+def rank0_print(*args, **kwargs):
     if is_main_process():
-        wandb.init(project=os.environ["WANDB_PROJECT"], reinit=True)
-    logger.info("Weights & Biases initialized.")
-
-    model = train_with_grpo(
-        model=model,
-        ref_model=ref_model,
-        tokenizer=tokenizer,
-        train_data=train_data_loader,
-        reward_function=combined_reward,
-        **training_config
-    )
-
-    if is_main_process():
-        wandb.finish()
-    logger.info("Training completed and wandb run finished.")
-
-    if do_eval:
-        logger.info("Final model evaluation after GRPO RL fine-tuning:")
-        post_grpo_accuracy = evaluate_model(model, tokenizer, eval_data_loader, current_device)
-        logger.info(f"Post-GRPO Accuracy: {post_grpo_accuracy:.2f}%")
-
-
-if __name__ == "__main__":
-    # Call the function to set random seed for reproducibility
-    set_random_seed(42)
-    init_logger()
-    main()
+        print(*args, **kwargs)
