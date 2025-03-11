@@ -1,3 +1,11 @@
+import torch
+import torch.nn as nn
+import wandb
+
+from utils import is_main_process
+from vlogging import logger
+
+
 def selective_log_softmax(logits, input_ids):
     """
     Computes log probabilities for specific tokens in the vocabulary.
@@ -16,6 +24,7 @@ def selective_log_softmax(logits, input_ids):
     """
     log_probs = nn.functional.log_softmax(logits, dim=-1)
     return log_probs.gather(dim=-1, index=input_ids.unsqueeze(-1)).squeeze(-1)
+
 
 def compute_log_probs(model, input_ids, attention_mask, logits_to_keep):
     """
@@ -41,6 +50,7 @@ def compute_log_probs(model, input_ids, attention_mask, logits_to_keep):
     logits = logits[:, -logits_to_keep:, :]
     return selective_log_softmax(logits, input_ids)
 
+
 def create_completion_mask(completion_ids, eos_token_id):
     """
     Creates a mask for completion tokens that excludes tokens after the EOS token.
@@ -65,6 +75,7 @@ def create_completion_mask(completion_ids, eos_token_id):
     sequence_indices = torch.arange(is_eos.size(1), device=completion_ids.device).expand(is_eos.size(0), -1)
     return (sequence_indices <= eos_idx.unsqueeze(1)).int()
 
+
 def generate_completions(model, tokenizer, prompts, num_generations=4, max_completion_length=32):
     """
     Generates multiple completions for each prompt.
@@ -86,11 +97,11 @@ def generate_completions(model, tokenizer, prompts, num_generations=4, max_compl
         4. Extracts the completion IDs (excluding the prompt tokens).
         5. Creates a mask for the completions using create_completion_mask.
     """
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    device = f"cuda:{torch.cuda.current_device()}"
     inputs = tokenizer(prompts, return_tensors="pt", padding=True, padding_side="left")
     prompt_ids = inputs["input_ids"].to(device)
     prompt_mask = inputs["attention_mask"].to(device)
-    print(f"Input batch size: {prompt_ids.size(0)}, Device before model: {prompt_ids.device}")
+    logger.info(f"Rollout Input batch size: {prompt_ids.size(0)}")
     prompt_length = prompt_ids.size(1)
     prompt_ids = prompt_ids.repeat_interleave(num_generations, dim=0)
     prompt_mask = prompt_mask.repeat_interleave(num_generations, dim=0)
@@ -104,10 +115,11 @@ def generate_completions(model, tokenizer, prompts, num_generations=4, max_compl
         eos_token_id=tokenizer.eos_token_id,
         early_stopping=False
     )
-    print(f"Output batch size: {outputs.size(0)}, Device after model: {outputs.device}")
+    logger.info(f"Rollout Output batch size: {outputs.size(0)}")
     completion_ids = outputs[:, prompt_length:]
     completion_mask = create_completion_mask(completion_ids, tokenizer.eos_token_id)
     return prompt_ids, prompt_mask, completion_ids, completion_mask
+
 
 def generate_rollout_data(model, ref_model, tokenizer, batch_samples, num_generations, max_completion_length):
     """
@@ -133,9 +145,8 @@ def generate_rollout_data(model, ref_model, tokenizer, batch_samples, num_genera
         6. Repeats prompts and answers to match the number of generated completions.
         7. Returns all data needed for GRPO loss calculation.
     """
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    prompts = [sample["prompt"] if isinstance(sample, dict) else sample[0] for sample in batch_samples]
-    answers = [sample["answer"] if isinstance(sample, dict) else sample[1] for sample in batch_samples]
+    prompts = [sample for sample in batch_samples['prompt']]
+    answers = [sample for sample in batch_samples['answer']]
     with torch.no_grad():
         prompt_ids, prompt_mask, completion_ids, completion_mask = generate_completions(
             model, tokenizer, prompts, num_generations, max_completion_length
@@ -161,6 +172,7 @@ def generate_rollout_data(model, ref_model, tokenizer, batch_samples, num_genera
         "batch_size": len(prompts),
         "num_generations": num_generations
     }
+
 
 def grpo_loss(model, ref_model, rollout_data, tokenizer, reward_function, beta=0.01, epsilon=0.2):
     """
@@ -188,7 +200,7 @@ def grpo_loss(model, ref_model, rollout_data, tokenizer, reward_function, beta=0
         7. Combines surrogate loss and KL penalty.
         8. Averages the loss across all tokens and batches.
     """
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    device = f"cuda:{torch.cuda.current_device()}"
     input_ids = rollout_data["input_ids"]
     attention_mask = rollout_data["attention_mask"]
     completion_mask = rollout_data["completion_mask"]
@@ -197,17 +209,19 @@ def grpo_loss(model, ref_model, rollout_data, tokenizer, reward_function, beta=0
     ref_log_probs = rollout_data["ref_log_probs"]
     token_log_probs = compute_log_probs(model, input_ids, attention_mask, logits_to_keep)
     ratio = torch.exp(token_log_probs - old_log_probs)
+    assert torch.allclose(ratio, torch.ones_like(ratio))
     rewards = torch.tensor(
-        reward_function(prompts=rollout_data["repeated_prompts"], completions=rollout_data["formatted_completions"], answer=rollout_data["repeated_answers"]),
+        reward_function(prompts=rollout_data["repeated_prompts"],
+                        completions=rollout_data["formatted_completions"], answer=rollout_data["repeated_answers"]),
         dtype=torch.float32,
         device=device
     )
-    #print(f"Rewards: {rewards}")  # Debug rewards
+    # print(f"Rewards: {rewards}")  # Debug rewards
     batch_size = rollout_data["batch_size"]
     num_generations = rollout_data["num_generations"]
     rewards = rewards.view(batch_size, num_generations)
     avg_reward = rewards.mean().item()
-    print("Average Reward:", avg_reward)
+    logger.info(f"Average Reward: {avg_reward}")
     mean_rewards = rewards.mean(dim=1).repeat_interleave(num_generations)
     std_rewards = rewards.std(dim=1).repeat_interleave(num_generations)
     advantages = ((rewards.view(-1) - mean_rewards) / (std_rewards + 1e-4)).unsqueeze(1)
@@ -219,9 +233,22 @@ def grpo_loss(model, ref_model, rollout_data, tokenizer, reward_function, beta=0
     loss = -((per_token_loss * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)).mean()
     return loss, avg_reward
 
-def train_with_grpo(model, tokenizer, train_data, num_iterations=1, num_steps=500, batch_size=4,
-                              num_generations=4, max_completion_length=128, beta=0.1,
-                              learning_rate=5e-6, mu=3, epsilon=0.2, reward_function=None, device_ids=None):
+
+def train_with_grpo(
+    model,
+    ref_model,
+    tokenizer,
+    train_data,
+    num_iterations,
+    num_steps,
+    num_generations,
+    max_completion_length,
+    beta,
+    learning_rate,
+    mu,
+    epsilon,
+    reward_function,
+):
     """
     This function is your original working code (train_with_grpo_static)
     with an added outer loop for iterative GRPO updates per the pseudocode.
@@ -257,45 +284,30 @@ def train_with_grpo(model, tokenizer, train_data, num_iterations=1, num_steps=50
                 ii. Updates the policy model using gradient descent.
            - Monitors GPU memory usage and prints progress information.
     """
-    assert device_ids is not None and len(device_ids) > 1, "This code needs at least 2 GPU cores to run!"
-
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-
-    # Wrap model with DataParallel if multiple GPUs are available.
-
-    model = nn.DataParallel(model, device_ids=device_ids)
-    print(f"Model wrapped with DataParallel across GPUs: {device_ids}")
-
     # Outer loop: iterative GRPO updates.
     for iteration in range(num_iterations):
-        print(f"\nIteration {iteration+1}/{num_iterations}")
-
-        # Create a reference model (deep copy) and set it to eval mode.
-        ref_model = copy.deepcopy(model.module)
-        ref_model.eval()
-        for param in ref_model.parameters():
-            param.requires_grad = False
-        print("Reference model created.")
-
+        logger.info(f"Iteration {iteration+1}/{num_iterations}")
         # Reinitialize the optimizer for this iteration.
         optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
         model.train()
 
+        step = 0
         # Inner loop: your original training steps.
-        for step in range(num_steps):
-            batch_samples = random.sample(train_data, batch_size)
+        for batch in train_data:
+            if step + 1 > num_steps:
+                break
             with torch.no_grad():
                 rollout_data = generate_rollout_data(
-                    model.module,
+                    model,
                     ref_model,
                     tokenizer,
-                    batch_samples,
+                    batch,
                     num_generations,
                     max_completion_length
                 )
             for grpo_iter in range(mu):
                 loss, avg_reward = grpo_loss(
-                    model.module,
+                    model,
                     ref_model,
                     rollout_data,
                     tokenizer,
@@ -305,20 +317,19 @@ def train_with_grpo(model, tokenizer, train_data, num_iterations=1, num_steps=50
                 )
                 optimizer.zero_grad()
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.1)
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1)
                 optimizer.step()
                 # Log to wandb
-                wandb.log({
-                    "loss": loss.item(),
-                    "average_reward": avg_reward,
-                    "iteration": iteration + 1,
-                    "step": step + 1,
-                    "grpo_iter": grpo_iter + 1
-                })
-                print(f"Iteration {iteration+1}/{num_iterations}, Step {step+1}/{num_steps}, "
-                      f"GRPO iter {grpo_iter+1}/{mu}, loss: {loss.item():.4f}")
-                #for i in range(torch.cuda.device_count()):
-                #    print(f"GPU {i} Usage: {torch.cuda.memory_allocated(i) / 1024**2:.2f} MiB, "
-                #          f"Utilization: {torch.cuda.utilization(i)}%")
-                # Uncomment to see the GPU utilization stats
-    return model.module
+                if is_main_process():
+                    wandb.log({
+                        "loss": loss.item(),
+                        "average_reward": avg_reward,
+                        "iteration": iteration + 1,
+                        "step": step + 1,
+                        "grpo_iter": grpo_iter + 1
+                    })
+                step += 1
+                logger.info(
+                    f"Iteration {iteration+1}/{num_iterations}, Step {step+1}/{num_steps}, "
+                    f"GRPO iter {grpo_iter+1}/{mu}, loss: {loss.item():.4f}, grad_norm: {grad_norm.item():.4f}")
+    return model
