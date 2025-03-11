@@ -1,7 +1,8 @@
 # tf-keras # for some reason, Hugging Face cannot work without it
 # flash-attn # FlashAttention2
-wandb # Weights and Biases
+wandb==0.16.0 # Weights and Biases
 accelerate>=0.26.0
-transformers # Hugging Face Transformers API
+transformers==4.49.0 # Hugging Face Transformers API
 datasets # Hugging Face Datasets API
-torch
+torch==2.6.0
+numpy==1.26.4
