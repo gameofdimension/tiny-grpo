@@ -1,3 +1,9 @@
+import random
+
+import torch
+from datasets import load_dataset
+from torch.utils.data import DataLoader
+
 SYSTEM_PROMPT = """
 Respond in the following format:
 <reasoning>
@@ -61,7 +67,7 @@ def extract_answer_from_dataset(text):
     return text.split("####")[1].strip()
 
 
-def prepare_dataset(split="train"):
+def prepare_dataset(data_path, split="train"):
     """
     Load and prepare the GSM8K dataset for training with string prompts.
 
@@ -80,7 +86,8 @@ def prepare_dataset(split="train"):
            - Creates a formatted example dictionary with prompt and answer.
         3. Returns the list of formatted examples ready for model training or evaluation.
     """
-    data = load_dataset('openai/gsm8k', 'main')[split]
+    # data = load_dataset('openai/gsm8k', 'main')[split]
+    data = load_dataset(data_path, 'main')[split]
     formatted_data = []
     for example in data:
         # Convert list of messages to a single string prompt.
@@ -113,3 +120,32 @@ def build_prompt(messages):
         4. This preserves the training format while converting from structured messages to a string.
     """
     return "\n".join([msg["content"].strip() for msg in messages])
+
+
+def make_dataloaders(data_path, distributed, dp_degree, dp_rank, train_batch_size, num_workers):
+    all_data = prepare_dataset(data_path, "train")
+    random.shuffle(all_data)
+    size_of_eval_data = 32  # change to a smaller value to save time or to a larger number for a more reliable estimate
+    eval_data = all_data[:size_of_eval_data]
+    train_data = all_data[size_of_eval_data:]
+
+    def build_dataloader(dataset, is_train):
+        if distributed:
+            sampler = torch.utils.data.distributed.DistributedSampler(  # type: ignore # noqa
+                dataset,
+                num_replicas=dp_degree,
+                rank=dp_rank,
+                shuffle=True,
+            )
+        else:
+            sampler = torch.utils.data.SequentialSampler(dataset)  # type: ignore
+        return DataLoader(
+            dataset=dataset,
+            batch_size=train_batch_size if is_train else 1,
+            drop_last=True if is_train else False,
+            sampler=sampler,
+            num_workers=num_workers,
+            pin_memory=True,
+        )
+
+    return build_dataloader(train_data, is_train=True), build_dataloader(eval_data, is_train=False)
