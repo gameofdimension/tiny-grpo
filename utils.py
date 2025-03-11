@@ -1,66 +1,96 @@
-# !pip install tf-keras # for some reason, Hugging Face cannot work without it
-# !pip install flash-attn # FlashAttention2
-# !pip install wandb # Weights and Biases
-# !pip install 'accelerate>=0.26.0'
-# !pip install transformers # Hugging Face Transformers API
-# !pip install datasets # Hugging Face Datasets API
-
-# Import necessary libraries
-# Basic Python libraries for various operations
-import random
-import copy
-import re
 import os
-import numpy as np
-import wandb
+import sys
 
-# PyTorch and related libraries for deep learning
 import torch
-import torch.nn as nn
-from torch.nn.utils.rnn import pad_sequence
+import torch.distributed as dist
+import wandb
+from torch.distributed.device_mesh import init_device_mesh
 
-# Hugging Face libraries for transformer models
-from transformers import AutoModelForCausalLM, AutoTokenizer
-from datasets import load_dataset
+from data import make_dataloaders
+from eval import evaluate_model
+from loss import train_with_grpo
+from model import (load_tokenizer, prepare_actor_rollout_model,
+                   prepare_ref_model)
+from reward import combined_reward
+from utils import init_distributed, is_main_process, set_random_seed
+from vlogging import init_logger, logger
 
-def set_random_seed(seed: int = 42):
-    """
-    Set the random seed for reproducibility across Python, NumPy, and PyTorch.
 
-    Args:
-        seed (int): The seed value to use for random number generation.
+def main():
+    world_size, rank, local_rank = init_distributed()
+    model_name = sys.argv[1]
 
-    Returns:
-        None
+    tokenizer = load_tokenizer(model_name)
+    mesh = init_device_mesh(device_type='cuda', mesh_shape=(dist.get_world_size(),))
+    model = prepare_actor_rollout_model(
+        ckpt_path=model_name,
+        eos_token_id=tokenizer.eos_token_id,
+        compile=False,
+        sac='no',
+        mesh=mesh,
+    )
+    ref_model = prepare_ref_model(
+        ckpt_path=model_name,
+        eos_token_id=tokenizer.eos_token_id,
+        compile=False,
+        mesh=mesh,
+    )
 
-    Explanation:
-        1. Sets seed for Python's built-in random module for basic random operations.
-        2. Sets seed for NumPy, ensuring consistent random number generation in array operations.
-        3. Sets seed for PyTorch CPU operations.
-        4. If CUDA is available, sets seed for all GPU devices.
-        5. Configures cuDNN to ensure deterministic behavior:
-           - Sets deterministic flag to True, ensuring reproducible results.
-           - Disables benchmarking to prevent algorithm selection based on hardware.
+    batch_size = 1
+    train_data_loader, eval_data_loader = make_dataloaders(
+        data_path=sys.argv[2],
+        distributed=True,
+        dp_degree=world_size,
+        dp_rank=rank,
+        train_batch_size=batch_size,
+        num_workers=4
+    )
 
-    Note:
-        Setting deterministic behavior may impact performance but ensures consistent results
-        across multiple runs, which is crucial for debugging and research.
-    """
-    # Set the seed for Python's built-in random module
-    random.seed(seed)
-    # Set the seed for NumPy
-    np.random.seed(seed)
-    # Set the seed for PyTorch
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-    # Ensure deterministic behavior in cuDNN (may impact performance)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+    current_device = torch.device(f"cuda:{torch.cuda.current_device()}")
+    do_eval = sys.argv[3].lower() == "yes"
+    if do_eval:
+        logger.info("Initial model evaluation before finetuning:")
+        pre_grpo_accuracy = evaluate_model(model, tokenizer, eval_data_loader, current_device)
+        logger.info(f"Pre-GRPO Accuracy: {pre_grpo_accuracy:.2f}%")
+    logger.info("Starting RL fine-tuning using GRPO...")
+    # This config was tested on a 8xA100 node, where each A100 is has 80GB of VRAM
+    training_config = {
+        'num_iterations': 1,
+        'num_steps': 500,
+        'num_generations': 12,  # reduce if you have GPUs with less VRAM
+        'max_completion_length': 400,  # reduce if you have GPUs with less VRAM
+        'beta': 0.04,
+        'learning_rate': 1e-6,
+        'mu': 1,
+        'epsilon': 0.1
+    }
 
-# Call the function to set random seed for reproducibility
-set_random_seed(42)
+    # Initialize Weights & Biases
+    if is_main_process():
+        wandb.init(project=os.environ["WANDB_PROJECT"], reinit=True)
+    logger.info("Weights & Biases initialized.")
 
-# Set environment variables for Weights & Biases (wandb) logging
-os.environ["WANDB_API_KEY"] = "USE YOUR KEY"
-os.environ["WANDB_PROJECT"] = "GRPO-Qwen-1.5-Instruct-Multi-GPU"
+    model = train_with_grpo(
+        model=model,
+        ref_model=ref_model,
+        tokenizer=tokenizer,
+        train_data=train_data_loader,
+        reward_function=combined_reward,
+        **training_config
+    )
+
+    if is_main_process():
+        wandb.finish()
+    logger.info("Training completed and wandb run finished.")
+
+    if do_eval:
+        logger.info("Final model evaluation after GRPO RL fine-tuning:")
+        post_grpo_accuracy = evaluate_model(model, tokenizer, eval_data_loader, current_device)
+        logger.info(f"Post-GRPO Accuracy: {post_grpo_accuracy:.2f}%")
+
+
+if __name__ == "__main__":
+    # Call the function to set random seed for reproducibility
+    set_random_seed(42)
+    init_logger()
+    main()
